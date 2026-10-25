@@ -4,22 +4,38 @@ LAN File Transfer Server
 
 A tiny FastAPI app that turns a folder on your PC (./storage/) into a
 drop box any device on the same Wi-Fi/LAN can reach through a browser.
+Protected by a single shared password.
 
 Run:
+    python -m venv venv
+    source venv/bin/activate      # Windows: venv\\Scripts\\activate
     pip install -r requirements.txt
     python app.py
+
+First run asks you to choose a password. To change it later:
+    python app.py --set-password
 
 Then, on your phone (connected to the same Wi-Fi), open:
     http://<your-pc-lan-ip>:8000
 """
 
+import asyncio
+import getpass
+import hashlib
+import hmac
 import html
+import json
+import os
+import secrets
 import shutil
 import socket
+import sys
+import time
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from starlette.middleware.sessions import SessionMiddleware
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -29,7 +45,121 @@ BASE_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = BASE_DIR / "storage"
 STORAGE_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="LAN File Transfer")
+AUTH_FILE = BASE_DIR / "auth.json"
+SESSION_DAYS = 30
+MAX_FAILS = 5            # wrong passwords allowed per IP...
+LOCKOUT_SECONDS = 300    # ...before that IP is locked out for this long
+
+
+# ---------------------------------------------------------------------------
+# Authentication helpers
+# ---------------------------------------------------------------------------
+
+def hash_password(password: str, salt: bytes) -> bytes:
+    return hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
+
+
+def set_password() -> dict:
+    """Prompt for a password and save its hash (never the password itself).
+
+    Also generates a fresh session-signing key, so changing the password
+    logs out every device.
+    """
+    while True:
+        pw = getpass.getpass("Choose a password (min 8 characters): ")
+        if len(pw) < 8:
+            print("Too short, try again.")
+            continue
+        if pw != getpass.getpass("Repeat password: "):
+            print("Passwords don't match, try again.")
+            continue
+        break
+
+    salt = secrets.token_bytes(16)
+    data = {
+        "salt": salt.hex(),
+        "hash": hash_password(pw, salt).hex(),
+        "secret_key": secrets.token_hex(32),
+    }
+    AUTH_FILE.write_text(json.dumps(data))
+    try:
+        os.chmod(AUTH_FILE, 0o600)  # owner-only (no-op on Windows)
+    except OSError:
+        pass
+    return data
+
+
+def load_auth() -> dict:
+    if AUTH_FILE.exists():
+        return json.loads(AUTH_FILE.read_text())
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            "No password set. Run 'python app.py' in a terminal to create one."
+        )
+    print("First run: set a password for the site.")
+    return set_password()
+
+
+def verify_password(password: str) -> bool:
+    salt = bytes.fromhex(AUTH["salt"])
+    expected = bytes.fromhex(AUTH["hash"])
+    return hmac.compare_digest(hash_password(password, salt), expected)
+
+
+# Simple in-memory brute-force protection, tracked per client IP.
+_fails: dict[str, list] = {}  # ip -> [failure_count, locked_until_timestamp]
+
+
+def lockout_remaining(ip: str) -> int:
+    entry = _fails.get(ip)
+    if entry and entry[1] > time.time():
+        return int(entry[1] - time.time()) + 1
+    return 0
+
+
+def register_failure(ip: str) -> None:
+    entry = _fails.setdefault(ip, [0, 0.0])
+    entry[0] += 1
+    if entry[0] >= MAX_FAILS:
+        entry[0] = 0
+        entry[1] = time.time() + LOCKOUT_SECONDS
+
+
+class NotAuthenticated(Exception):
+    pass
+
+
+def require_login(request: Request) -> None:
+    if not request.session.get("auth"):
+        raise NotAuthenticated()
+
+
+# `python app.py --set-password` just changes the password and exits.
+if __name__ == "__main__" and "--set-password" in sys.argv:
+    set_password()
+    print("Password updated. All devices will need to log in again.")
+    sys.exit(0)
+
+AUTH = load_auth()
+
+# docs/openapi are disabled: they'd otherwise be reachable without logging in.
+app = FastAPI(title="LAN File Transfer", docs_url=None, redoc_url=None, openapi_url=None)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=AUTH["secret_key"],
+    session_cookie="lan_session",
+    max_age=SESSION_DAYS * 24 * 3600,
+    same_site="lax",
+    https_only=False,  # plain HTTP on the LAN
+)
+
+# Every route on this router requires a login.
+protected = APIRouter(dependencies=[Depends(require_login)])
+
+
+@app.exception_handler(NotAuthenticated)
+async def redirect_to_login(request: Request, exc: NotAuthenticated):
+    return RedirectResponse(url="/login", status_code=303)
 
 
 # ---------------------------------------------------------------------------
@@ -87,11 +217,61 @@ def page(body: str) -> str:
 </html>"""
 
 
+def login_body(error: str = "") -> str:
+    err = f'<p style="color:red">{html.escape(error)}</p>' if error else ""
+    return f"""
+    <h2>Log in</h2>
+    {err}
+    <form action="/login" method="post">
+        <input type="password" name="password" placeholder="Password" autofocus required>
+        <button type="submit">Log in</button>
+    </form>"""
+
+
 # ---------------------------------------------------------------------------
-# Routes
+# Public routes (login / logout)
 # ---------------------------------------------------------------------------
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/login", response_class=HTMLResponse)
+def login_form(request: Request):
+    if request.session.get("auth"):
+        return RedirectResponse(url="/", status_code=303)
+    return page(login_body())
+
+
+@app.post("/login", response_class=HTMLResponse)
+async def login(request: Request, password: str = Form(...)):
+    ip = request.client.host if request.client else "unknown"
+
+    wait = lockout_remaining(ip)
+    if wait:
+        return HTMLResponse(
+            page(login_body(f"Too many failed attempts. Try again in {wait}s.")),
+            status_code=429,
+        )
+
+    if verify_password(password):
+        _fails.pop(ip, None)
+        request.session.clear()
+        request.session["auth"] = True
+        return RedirectResponse(url="/", status_code=303)
+
+    register_failure(ip)
+    await asyncio.sleep(1)  # slow down guessing
+    return HTMLResponse(page(login_body("Wrong password.")), status_code=401)
+
+
+@app.post("/logout")
+def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse(url="/login", status_code=303)
+
+
+# ---------------------------------------------------------------------------
+# Protected routes
+# ---------------------------------------------------------------------------
+
+@protected.get("/", response_class=HTMLResponse)
 def index():
     files = sorted(
         (p for p in STORAGE_DIR.iterdir() if p.is_file()),
@@ -123,6 +303,10 @@ def index():
         file_list = "<p>No files yet.</p>"
 
     body = f"""
+    <form action="/logout" method="post">
+        <button type="submit">Log out</button>
+    </form>
+
     <h2>Upload a file</h2>
     <form action="/upload" method="post" enctype="multipart/form-data">
         <input type="file" name="file" required>
@@ -135,7 +319,7 @@ def index():
     return page(body)
 
 
-@app.post("/upload")
+@protected.post("/upload")
 async def upload(file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
@@ -156,7 +340,7 @@ async def upload(file: UploadFile = File(...)):
     return RedirectResponse(url="/", status_code=303)
 
 
-@app.get("/download/{filename}")
+@protected.get("/download/{filename}")
 def download(filename: str):
     path = safe_path(filename)
     if not path.is_file():
@@ -164,13 +348,16 @@ def download(filename: str):
     return FileResponse(path, filename=path.name)
 
 
-@app.post("/delete/{filename}")
+@protected.post("/delete/{filename}")
 def delete(filename: str):
     path = safe_path(filename)
     if not path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
     path.unlink()
     return RedirectResponse(url="/", status_code=303)
+
+
+app.include_router(protected)
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +373,7 @@ if __name__ == "__main__":
     print(f" Storage folder: {STORAGE_DIR}")
     print(f" On this PC:     http://127.0.0.1:8000")
     print(f" On your phone:  http://{ip}:8000  (same Wi-Fi)")
+    print(" Change password: python app.py --set-password")
     print("=" * 50)
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
