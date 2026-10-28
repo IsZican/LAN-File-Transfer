@@ -6,15 +6,16 @@ A tiny FastAPI app that turns a folder on your PC into a drop box any device on 
 
 - Password-protected: login page, 30-day session cookie, logout button
 - Brute-force protection: 5 wrong passwords locks that device out for 5 minutes
-- Upload files from any device with a browser
-- Download or delete files from a simple web page
+- Upload multiple files at once from any device with a browser
+- Create folders and browse into them (breadcrumb navigation)
+- Download files, delete files and empty folders
 - Duplicate filenames are auto-renamed (`photo.jpg` → `photo (1).jpg`) instead of overwritten
-- Path traversal protection on download/delete
+- Path traversal protection on every path-taking route
 - Prints your LAN address on startup
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.9+
 - Dependencies in `requirements.txt`: `fastapi`, `uvicorn[standard]`, `python-multipart`, `itsdangerous`
 
 ## Setup
@@ -49,25 +50,30 @@ python app.py --set-password
 
 ## Usage
 
-| Action   | How                                              |
-|----------|--------------------------------------------------|
-| Upload   | Choose a file on the home page and click Upload  |
-| Download | Click a filename in the list                     |
-| Delete   | Click Delete next to a file and confirm          |
+| Action        | How                                                              |
+|---------------|------------------------------------------------------------------|
+| Upload        | Pick one or more files (hold Ctrl/Shift, or multi-select on a phone) and click Upload; they go into the folder you're viewing |
+| New folder    | Type a name and click Create (created inside the current folder) |
+| Open a folder | Click it; use the breadcrumb at the top to go back up            |
+| Download      | Click a filename                                                 |
+| Delete        | Click Delete and confirm. Folders must be empty first            |
 
-Files are stored in the `storage/` folder next to `app.py` (created automatically). You can also drop files into it directly.
+Everything lives in the `storage/` folder next to `app.py` (created automatically). You can also drop files and folders into it directly.
 
 ## Routes
 
-| Method | Path                  | Auth | Description                    |
-|--------|-----------------------|------|--------------------------------|
-| GET    | `/login`              | No   | Login page                     |
-| POST   | `/login`              | No   | Submit password                |
-| POST   | `/logout`             | No   | End session                    |
-| GET    | `/`                   | Yes  | File list and upload form      |
-| POST   | `/upload`             | Yes  | Upload a file (multipart)      |
-| GET    | `/download/{filename}`| Yes  | Download a file                |
-| POST   | `/delete/{filename}`  | Yes  | Delete a file                  |
+`path` is always relative to `storage/` (empty = root).
+
+| Method | Path        | Auth | Description                                    |
+|--------|-------------|------|------------------------------------------------|
+| GET    | `/login`    | No   | Login page                                     |
+| POST   | `/login`    | No   | Submit password                                |
+| POST   | `/logout`   | No   | End session                                    |
+| GET    | `/?path=`   | Yes  | Browse a folder (list, upload and new-folder forms) |
+| POST   | `/upload`   | Yes  | Upload one or more files (`files`) into `path` |
+| POST   | `/mkdir`    | Yes  | Create folder `name` inside `path`             |
+| GET    | `/download?path=` | Yes | Download a file                          |
+| POST   | `/delete`   | Yes  | Delete the file or empty folder at `path`      |
 
 Unauthenticated requests to protected routes redirect to `/login`. The auto-generated `/docs` pages are disabled.
 

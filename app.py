@@ -32,6 +32,7 @@ import socket
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -176,17 +177,63 @@ def human_size(num_bytes: int) -> str:
     return f"{size:.1f} PB"
 
 
-def safe_path(filename: str) -> Path:
+def resolve_in_storage(rel: str) -> Path:
     """
-    Resolve a user-supplied filename to a path strictly inside STORAGE_DIR,
-    preventing path traversal (e.g. '../../etc/passwd').
+    Resolve a user-supplied relative path ('' = storage root) to an absolute
+    path strictly inside STORAGE_DIR, preventing path traversal
+    (e.g. '../../etc/passwd') and symlink escapes.
     """
-    # Strip any directory components the client might send.
-    candidate = STORAGE_DIR / Path(filename).name
-    resolved = candidate.resolve()
-    if resolved.parent != STORAGE_DIR.resolve():
-        raise HTTPException(status_code=400, detail="Invalid filename")
+    root = STORAGE_DIR.resolve()
+    resolved = (root / rel).resolve()
+    if not resolved.is_relative_to(root):
+        raise HTTPException(status_code=400, detail="Invalid path")
     return resolved
+
+
+def rel_path(p: Path) -> str:
+    """Path inside storage as a forward-slash string ('' for the root)."""
+    root = STORAGE_DIR.resolve()
+    return "" if p == root else p.relative_to(root).as_posix()
+
+
+def clean_filename(name: str) -> str:
+    """Strip any directory part from an uploaded filename ('' if unusable)."""
+    name = Path((name or "").replace("\\", "/")).name
+    return "" if name in (".", "..") else name
+
+
+def valid_folder_name(name: str) -> bool:
+    return (
+        bool(name)
+        and name not in (".", "..")
+        and len(name) <= 255
+        and not any(c in name for c in '/\\<>:"|?*\0')
+    )
+
+
+def unique_dest(directory: Path, name: str) -> Path:
+    """Return directory/name, or 'name (1).ext', 'name (2).ext'... if taken."""
+    dest = directory / name
+    stem, suffix = dest.stem, dest.suffix
+    counter = 1
+    while dest.exists():
+        dest = directory / f"{stem} ({counter}){suffix}"
+        counter += 1
+    return dest
+
+
+def browse_url(rel: str, msg: str = "") -> str:
+    params = {}
+    if rel:
+        params["path"] = rel
+    if msg:
+        params["msg"] = msg
+    return "/" + ("?" + urlencode(params) if params else "")
+
+
+def back(rel: str, msg: str = "") -> RedirectResponse:
+    """Redirect to a folder view, optionally with a one-line status message."""
+    return RedirectResponse(url=browse_url(rel, msg), status_code=303)
 
 
 def local_ip() -> str:
@@ -272,89 +319,159 @@ def logout(request: Request):
 # ---------------------------------------------------------------------------
 
 @protected.get("/", response_class=HTMLResponse)
-def index():
-    files = sorted(
-        (p for p in STORAGE_DIR.iterdir() if p.is_file()),
-        key=lambda p: p.name.lower(),
+def index(path: str = "", msg: str = ""):
+    current = resolve_in_storage(path)
+    if not current.is_dir():
+        raise HTTPException(status_code=404, detail="Folder not found")
+    rel = rel_path(current)
+
+    # Folders first, then files, each A-Z.
+    entries = sorted(
+        (p for p in current.iterdir() if p.is_dir() or p.is_file()),
+        key=lambda p: (not p.is_dir(), p.name.lower()),
     )
 
-    if files:
+    # Breadcrumb: Home / folder / subfolder
+    crumbs = [f'<a href="{browse_url("")}">Home</a>']
+    acc = ""
+    for part in rel.split("/") if rel else []:
+        acc = f"{acc}/{part}" if acc else part
+        crumbs.append(f'<a href="{html.escape(browse_url(acc))}">{html.escape(part)}</a>')
+    breadcrumb = " / ".join(crumbs)
+
+    if entries:
         rows = []
-        for f in files:
-            name = html.escape(f.name)
-            size = human_size(f.stat().st_size)
+        for p in entries:
+            child = f"{rel}/{p.name}" if rel else p.name
+            name = html.escape(p.name)
+            if p.is_dir():
+                href = html.escape(browse_url(child))
+                link = f'<a href="{href}">&#128193; {name}</a>'
+                size = "&mdash;"
+                question = f"Delete empty folder {p.name}?"
+            else:
+                href = html.escape("/download?" + urlencode({"path": child}))
+                link = f'<a href="{href}">{name}</a>'
+                size = human_size(p.stat().st_size)
+                question = f"Delete {p.name}?"
+            confirm_js = html.escape(json.dumps(question))
             rows.append(f"""
         <tr>
-            <td><a href="/download/{name}">{name}</a></td>
+            <td>{link}</td>
             <td>{size}</td>
             <td>
-                <form action="/delete/{name}" method="post"
-                      onsubmit="return confirm('Delete {name}?');">
+                <form action="/delete" method="post"
+                      onsubmit="return confirm({confirm_js});">
+                    <input type="hidden" name="path" value="{html.escape(child)}">
                     <button type="submit">Delete</button>
                 </form>
             </td>
         </tr>""")
-        file_list = f"""
+        listing = f"""
     <table border="1" cellpadding="6" cellspacing="0">
-        <tr><th>File</th><th>Size</th><th></th></tr>
+        <tr><th>Name</th><th>Size</th><th></th></tr>
         {''.join(rows)}
     </table>"""
     else:
-        file_list = "<p>No files yet.</p>"
+        listing = "<p>This folder is empty.</p>"
+
+    note = f"<p><em>{html.escape(msg)}</em></p>" if msg else ""
+    hidden_path = f'<input type="hidden" name="path" value="{html.escape(rel)}">'
 
     body = f"""
     <form action="/logout" method="post">
         <button type="submit">Log out</button>
     </form>
 
-    <h2>Upload a file</h2>
+    <p>{breadcrumb}</p>
+    {note}
+
+    <h2>Upload files</h2>
     <form action="/upload" method="post" enctype="multipart/form-data">
-        <input type="file" name="file" required>
+        {hidden_path}
+        <input type="file" name="files" multiple required>
         <button type="submit">Upload</button>
     </form>
 
-    <h2>Files in storage</h2>
-    {file_list}
+    <h2>New folder</h2>
+    <form action="/mkdir" method="post">
+        {hidden_path}
+        <input type="text" name="name" placeholder="Folder name" required>
+        <button type="submit">Create</button>
+    </form>
+
+    <h2>Contents</h2>
+    {listing}
     """
     return page(body)
 
 
 @protected.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No filename provided")
+def upload(path: str = Form(""), files: list[UploadFile] = File(...)):
+    # Plain `def` (not async): FastAPI runs it in a worker thread, so big
+    # uploads don't block other requests.
+    current = resolve_in_storage(path)
+    if not current.is_dir():
+        raise HTTPException(status_code=404, detail="Folder not found")
 
-    dest = STORAGE_DIR / Path(file.filename).name
+    saved = 0
+    for f in files:
+        name = clean_filename(f.filename)
+        if not name:
+            continue
+        with unique_dest(current, name).open("wb") as out_file:
+            shutil.copyfileobj(f.file, out_file)
+        saved += 1
 
-    # Avoid clobbering an existing file with the same name.
-    if dest.exists():
-        stem, suffix = dest.stem, dest.suffix
-        counter = 1
-        while dest.exists():
-            dest = STORAGE_DIR / f"{stem} ({counter}){suffix}"
-            counter += 1
-
-    with dest.open("wb") as out_file:
-        shutil.copyfileobj(file.file, out_file)
-
-    return RedirectResponse(url="/", status_code=303)
+    rel = rel_path(current)
+    if not saved:
+        return back(rel, "No files were uploaded.")
+    return back(rel, f"Uploaded {saved} file{'s' if saved != 1 else ''}.")
 
 
-@protected.get("/download/{filename}")
-def download(filename: str):
-    path = safe_path(filename)
-    if not path.is_file():
+@protected.post("/mkdir")
+def mkdir(path: str = Form(""), name: str = Form(...)):
+    current = resolve_in_storage(path)
+    if not current.is_dir():
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    rel = rel_path(current)
+    name = name.strip()
+    if not valid_folder_name(name):
+        return back(rel, "Invalid folder name.")
+
+    target = current / name
+    if target.exists():
+        return back(rel, f"'{name}' already exists.")
+    target.mkdir()
+    return back(rel, f"Created folder '{name}'.")
+
+
+@protected.get("/download")
+def download(path: str):
+    target = resolve_in_storage(path)
+    if not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(path, filename=path.name)
+    return FileResponse(target, filename=target.name)
 
 
-@protected.post("/delete/{filename}")
-def delete(filename: str):
-    path = safe_path(filename)
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
-    path.unlink()
-    return RedirectResponse(url="/", status_code=303)
+@protected.post("/delete")
+def delete(path: str = Form(...)):
+    target = resolve_in_storage(path)
+    if target == STORAGE_DIR.resolve():
+        raise HTTPException(status_code=400, detail="Can't delete the storage root")
+    parent = rel_path(target.parent)
+
+    if target.is_file():
+        target.unlink()
+        return back(parent, f"Deleted {target.name}.")
+    if target.is_dir():
+        try:
+            target.rmdir()  # only succeeds on empty folders
+        except OSError:
+            return back(parent, "Folder isn't empty. Delete its contents first.")
+        return back(parent, f"Deleted folder {target.name}.")
+    raise HTTPException(status_code=404, detail="Not found")
 
 
 app.include_router(protected)
